@@ -1,11 +1,28 @@
+import argparse
 import pandas as pd
 import requests
 import time
 import os
 import ast
 
-#main_folder: path to the main folder where the output file will be saved
-main_folder = "/Users/rbhattac/Desktop/Chikungunya_SFVT"
+#function to filter a UniProt TSV export down to only reviewed (Swiss-Prot) entries,
+#based on the 'Reviewed' column populated by UniProt taxonomic-search exports.
+def filter_reviewed_entries(uniprot_info):
+    if 'Reviewed' not in uniprot_info.columns:
+        raise ValueError(
+            "Expected a 'Reviewed' column in the input TSV to filter on, but it was not found. "
+            f"Available columns: {list(uniprot_info.columns)}"
+        )
+
+    total_count = len(uniprot_info)
+    is_reviewed = uniprot_info['Reviewed'].astype(str).str.strip().str.lower() == 'reviewed'
+    reviewed_df = uniprot_info[is_reviewed].reset_index(drop=True)
+
+    print(
+        f"Filtered to reviewed entries: {len(reviewed_df)} of {total_count} entries kept "
+        f"({total_count - len(reviewed_df)} unreviewed entries excluded)."
+    )
+    return reviewed_df
 
 #function to extract UniProt features from a TSV file obtained from taxonomic search of Uniprot
 # and output a csv file with the all extracted features from multiple UniProt IDs.
@@ -14,6 +31,9 @@ main_folder = "/Users/rbhattac/Desktop/Chikungunya_SFVT"
 def extract_and_merge_uniprot_features(tsv_file_path):
     # Read TSV file for UniProt IDs
     uniprot_info = pd.read_csv(tsv_file_path, delimiter="\t")
+
+    # Keep only reviewed (Swiss-Prot) entries; unreviewed entries do not proceed downstream
+    uniprot_info = filter_reviewed_entries(uniprot_info)
     uniprot_ids = uniprot_info['Entry']
 
     base_url = "https://rest.uniprot.org/uniprotkb/{}.json"
@@ -109,58 +129,92 @@ def extract_comments(merged_df):
 
     return pd.Series(comments)
 
-   
 
-merged_df = extract_and_merge_uniprot_features('/Users/rbhattac/Desktop/Chikungunya_SFVT/Chikungunya_uniprot.tsv')
-# Save the merged DataFrame to a CSV file
-merged_dataframe_file_path = os.path.join(main_folder, "merged_features.csv")
-merged_df.to_csv(merged_dataframe_file_path, index=False)
-# print(f"All features saved to {merged_dataframe_file_path}.")
-# print("Processing completed.")
-
-#create an empty dataframe for the new SF table with the features extracted from UniProt
-columns = ['virus_type', 'subtype', 'segment', 'genbank_accession', 'gene', 'product', 'sf_category',
-           'sf_type', 'start', 'end','segments', 'Source', 'source_id',
-           'source_strain', 'source_aa_sequence', 'source_sf_location','Evidence_code',
-           'additional_metadata', 'comments']
-
-SF_Table_Uniprot = pd.DataFrame(columns=columns)
-#print(SF_Table_Uniprot)
-#print(merged_df.columns)
-
-# Ensure SF_Table_Uniprot has the same number of rows as merged_df
-SF_Table_Uniprot = SF_Table_Uniprot.reindex(range(len(merged_df)))
-
-# Assign values to the new DataFrame from the merged DataFrame
-SF_Table_Uniprot['sf_type'] = merged_df['type'].values
-SF_Table_Uniprot['Source'] = "Uniprot"
-SF_Table_Uniprot['source_id'] = merged_df['uniprot_id'].values
-SF_Table_Uniprot['gene'] = merged_df['Gene Names'].values
-SF_Table_Uniprot['product'] = merged_df['Protein names'].values
-SF_Table_Uniprot['virus_type'] = merged_df['Organism'].values
-SF_Table_Uniprot['Evidence_code'] = "EXP"
-
-#calculate the length of the feature
-SF_Table_Uniprot['length'] = (merged_df['location.end.value'] - merged_df['location.start.value'])+1
-
-#fill the source_sf_location column with start and end positions
-SF_Table_Uniprot['source_sf_location'] = merged_df['location.start.value'].astype(str) + '-' + merged_df['location.end.value'].astype(str)
-
-#call function to parse the evidence column and get the publication information
-evidence_df = parse_evidence_column(merged_df)
-SF_Table_Uniprot['publication'] = evidence_df['Publication'].values
-#print(evidence_df)
-
-#call function for SF_category
-SF_Table_Uniprot['sf_category'] = parse_sf_category(merged_df)
-
-#call function to extract comments
-SF_Table_Uniprot['comments'] = extract_comments(merged_df)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Build a standardized Sequence Feature (SF) table from a UniProt "
+                    "taxonomic-search TSV export."
+    )
+    parser.add_argument(
+        "tsv_file",
+        help="Path to the input TSV file of UniProt IDs (from a UniProt taxonomic search).",
+    )
+    parser.add_argument(
+        "-o", "--outdir",
+        required=True,
+        help="Directory where output CSV files will be written (created if missing).",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        default="output",
+        help="Prefix used to name the output SF table, e.g. '<name>_Uniprot_SF.csv' "
+             "(default: 'output').",
+    )
+    parser.add_argument(
+        "--merged-filename",
+        default="merged_features.csv",
+        help="Filename for the intermediate merged UniProt features CSV "
+             "(default: 'merged_features.csv').",
+    )
+    return parser.parse_args()
 
 
-#write SF_Table_Uniprot to a csv file
-SF_Table_Uniprot_file_path = os.path.join(main_folder, "Chikungunya_Uniprot_SF.csv")
-SF_Table_Uniprot.to_csv(SF_Table_Uniprot_file_path, index=False)
-print(f"Measles_Uniprot.csv saved to {SF_Table_Uniprot_file_path}.")
+def main():
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
+    merged_df = extract_and_merge_uniprot_features(args.tsv_file)
+
+    # Save the merged DataFrame to a CSV file
+    merged_dataframe_file_path = os.path.join(args.outdir, args.merged_filename)
+    merged_df.to_csv(merged_dataframe_file_path, index=False)
+    print(f"All features saved to {merged_dataframe_file_path}.")
+
+    #create an empty dataframe for the new SF table with the features extracted from UniProt
+    columns = ['virus_type', 'subtype', 'segment', 'genbank_accession', 'gene', 'product', 'sf_category',
+               'sf_type', 'start', 'end', 'segments', 'Source', 'source_id',
+               'source_strain', 'source_aa_sequence', 'source_sf_location', 'Evidence_code',
+               'additional_metadata', 'comments']
+
+    sf_table_uniprot = pd.DataFrame(columns=columns)
+
+    # Ensure sf_table_uniprot has the same number of rows as merged_df
+    sf_table_uniprot = sf_table_uniprot.reindex(range(len(merged_df)))
+
+    # Assign values to the new DataFrame from the merged DataFrame
+    sf_table_uniprot['sf_type'] = merged_df['type'].values
+    sf_table_uniprot['Source'] = "Uniprot"
+    sf_table_uniprot['source_id'] = merged_df['uniprot_id'].values
+    sf_table_uniprot['gene'] = merged_df['Gene Names'].values
+    sf_table_uniprot['product'] = merged_df['Protein names'].values
+    sf_table_uniprot['virus_type'] = merged_df['Organism'].values
+    sf_table_uniprot['Evidence_code'] = "EXP"
+
+    #calculate the length of the feature
+    sf_table_uniprot['length'] = (merged_df['location.end.value'] - merged_df['location.start.value']) + 1
+
+    #fill the source_sf_location column with start and end positions
+    sf_table_uniprot['source_sf_location'] = (
+        merged_df['location.start.value'].astype(str) + '-' + merged_df['location.end.value'].astype(str)
+    )
+
+    #call function to parse the evidence column and get the publication information
+    evidence_df = parse_evidence_column(merged_df)
+    sf_table_uniprot['publication'] = evidence_df['Publication'].values
+
+    #call function for SF_category
+    sf_table_uniprot['sf_category'] = parse_sf_category(merged_df)
+
+    #call function to extract comments
+    sf_table_uniprot['comments'] = extract_comments(merged_df)
+
+    #write sf_table_uniprot to a csv file
+    sf_table_uniprot_file_path = os.path.join(args.outdir, f"{args.name}_Uniprot_SF.csv")
+    sf_table_uniprot.to_csv(sf_table_uniprot_file_path, index=False)
+
+    print(f"{args.name}_Uniprot_SF.csv saved to {sf_table_uniprot_file_path}.")
+
+
+if __name__ == "__main__":
+    main()
 

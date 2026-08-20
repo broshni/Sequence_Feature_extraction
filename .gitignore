@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Pipeline scratch/output (generated CSVs, xlsx exports, alignment scratch files)
+*_mapping_scratch/

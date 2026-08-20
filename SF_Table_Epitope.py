@@ -1,4 +1,6 @@
-# read a csv file obtained by doing a search on IEDB for a virus
+# read an Excel export obtained by doing a search on IEDB for a virus
+import argparse
+import os
 import pandas as pd
 import re
 
@@ -28,23 +30,49 @@ def extract_source_accession(df):
         raise ValueError("Column 'Source Molecule IRI' not found in the DataFrame.")
 
 #function to extract source_sf_location, length and source_aa_sequence for the linear peptide epitope.
+#Linear peptide rows with a missing/non-numeric Starting or Ending Position are left blank
+#(instead of crashing) and reported so the underlying data gap can be investigated separately.
 def extract_linear_info(df):
-    if 'Object Type' in df.columns and 'Starting Position' in df.columns and 'Ending Position' in df.columns and 'Name' in df.columns:
-        source_sf_location = df.apply(
-            lambda x: f"{x['Starting Position']}-{x['Ending Position']}" if x['Object Type'] == 'Linear peptide' else None,
-            axis=1
-        )
-        length = df.apply(
-            lambda x: int(x['Ending Position']) - int(x['Starting Position']) + 1 if x['Object Type'] == 'Linear peptide' else None,
-            axis=1
-        )
-        source_aa_sequence = df.apply(
-            lambda x: x['Name'] if x['Object Type'] == 'Linear peptide' else None,
-            axis=1
-        )
-        return source_sf_location, length, source_aa_sequence
-    else:
+    required_columns = {'Object Type', 'Starting Position', 'Ending Position', 'Name'}
+    if not required_columns.issubset(df.columns):
         raise ValueError("Required columns not found in the DataFrame.")
+
+    missing_position_rows = []
+
+    def _row_info(x):
+        if x['Object Type'] != 'Linear peptide':
+            return pd.Series({'source_sf_location': None, 'length': None, 'source_aa_sequence': None})
+
+        start = pd.to_numeric(x['Starting Position'], errors='coerce')
+        end = pd.to_numeric(x['Ending Position'], errors='coerce')
+
+        if pd.isna(start) or pd.isna(end):
+            missing_position_rows.append(str(x.get('Name', '')))
+            return pd.Series({
+                'source_sf_location': None,
+                'length': None,
+                'source_aa_sequence': x['Name'],
+            })
+
+        start_i, end_i = int(start), int(end)
+        return pd.Series({
+            'source_sf_location': f"{start_i}-{end_i}",
+            'length': end_i - start_i + 1,
+            'source_aa_sequence': x['Name'],
+        })
+
+    result = df.apply(_row_info, axis=1)
+
+    if missing_position_rows:
+        sample = ', '.join(missing_position_rows[:5])
+        more = '' if len(missing_position_rows) <= 5 else f" (+{len(missing_position_rows) - 5} more)"
+        print(
+            f"Warning: {len(missing_position_rows)} 'Linear peptide' row(s) missing/non-numeric "
+            f"Starting or Ending Position - source_sf_location and length left blank for these. "
+            f"Examples: {sample}{more}"
+        )
+
+    return result['source_sf_location'], result['length'], result['source_aa_sequence']
 
 
 # Function to extract source_sf_location, length and source_aa_sequence for the Discontinuous peptide epitope.
@@ -100,62 +128,173 @@ def parse_epitope_info(df):
             'length': linear_length.combine_first(discontinuous_length),
             'source_aa_sequence': linear_sequence.combine_first(discontinuous_sequence)
         })
+        # Use a nullable integer dtype so whole-number lengths render as "15" rather than
+        # "15.0" (plain int dtype can't hold NaN for any row that ends up with no length).
+        parsed_df['length'] = parsed_df['length'].astype('Int64')
         return parsed_df
     else:
         raise ValueError("Column 'Object Type' not found in the DataFrame.")
 
 
-#read the CSV file containing epitope data
-df_temp = pd.read_csv("/Users/rbhattac/Desktop/Chikungunya_SFVT/Chikungunya_IEDB.csv")
+#function to drop epitopes whose Object Type is "Discontinuous peptide on multi chain" -
+#these don't have a single-chain location/sequence that this pipeline can represent.
+#Matching is fuzzy (case-insensitive, ignores spaces/hyphens/underscores) so variants like
+#"Discontinuous peptide on multichain", "Multi-Chain", extra whitespace, etc. are all caught.
+def filter_multichain_discontinuous(df):
+    if 'Object Type' not in df.columns:
+        raise ValueError("Column 'Object Type' not found in the DataFrame.")
 
-# Remove columns containing "Related Object" in their header
-df_epitope = df_temp.loc[:, ~df_temp.columns.str.contains("Related Object")]
-#print(SF_Table_epitope.columns)
+    def _normalize(value):
+        return re.sub(r'[^a-z0-9]', '', str(value).lower())
 
-#remove the first row and make the second row the header
-df_epitope.columns = df_epitope.iloc[0]
-df_epitope = df_epitope[1:]
-#reset the index
-df_epitope.reset_index(drop=True, inplace=True)
+    target = _normalize('Discontinuous peptide on multi chain')
 
-print(df_epitope.columns)
+    total_count = len(df)
+    is_multichain = df['Object Type'].apply(lambda x: _normalize(x) == target)
+    filtered_df = df[~is_multichain].reset_index(drop=True)
 
-#create an empty dataframe for the new SF table with the features extracted from UniProt
-columns = ['virus_type', 'subtype', 'segment', 'genbank_accession', 'gene', 'product', 'sf_category',
-           'sf_type', 'start', 'end','segments', 'Source', 'source_id',
-           'source_strain', 'source_aa_sequence', 'source_sf_location','Evidence_code',
-           'additional_metadata', 'comments']
-
-SF_Table_epitope = pd.DataFrame(columns=columns)
-
-# Ensure SF_Table_epitope has the same number of rows as df_epitope
-SF_Table_epitope = SF_Table_epitope.reindex(range(len(df_epitope)))
-
-# Assign values to the new DataFrame from the df_epitope DataFrame
-SF_Table_epitope['sf_type'] = "epitope"
-SF_Table_epitope['virus_type'] = df_epitope['Species'].values
-SF_Table_epitope['product'] = df_epitope['Source Molecule'].values
-SF_Table_epitope['sf_category'] = 'Epitope'
-SF_Table_epitope['Source'] = "IEDB"
-SF_Table_epitope['evidence_code'] = "EXP"
-SF_Table_epitope['comments'] = "Epitope, " + df_epitope['Object Type'].fillna('').astype(str)
-
-#call function to obtain the IEDB ID for each epitope
-SF_Table_epitope['source_id'] = extract_iedb_id(df_epitope)
-
-# call function to obtain the source accession for each epitope
-SF_Table_epitope['additional_metadata'] = extract_source_accession(df_epitope)
-
-#call function to parse the epitope information and obtain source_sf_location, length and source_aa_sequence
-parsed_epitope_info = parse_epitope_info(df_epitope)
-print(parsed_epitope_info)
-SF_Table_epitope['source_sf_location'] = parsed_epitope_info['source_sf_location']
-SF_Table_epitope['length'] = parsed_epitope_info['length']
-SF_Table_epitope['source_aa_sequence'] = parsed_epitope_info['source_aa_sequence']
+    print(
+        f"Removed {int(is_multichain.sum())} 'Discontinuous peptide on multi chain' entries "
+        f"out of {total_count} total rows; {len(filtered_df)} rows remain."
+    )
+    return filtered_df
 
 
-#write SF_Table_epitope to a csv file
-SF_Table_epitope.to_csv("/Users/rbhattac/Desktop/Chikungunya_SFVT/Chikungunya_epitope_SF.csv", index=False)
+#function to drop 'Linear peptide' epitopes with a missing/non-numeric Starting or Ending
+#Position - these can't be assigned a real source_sf_location/length, so rather than leaving
+#blank values in the final table they're excluded and returned separately for review.
+def filter_missing_linear_positions(df):
+    required_columns = {'Object Type', 'Starting Position', 'Ending Position'}
+    if not required_columns.issubset(df.columns):
+        raise ValueError("Required columns not found in the DataFrame.")
+
+    start = pd.to_numeric(df['Starting Position'], errors='coerce')
+    end = pd.to_numeric(df['Ending Position'], errors='coerce')
+    is_linear = df['Object Type'] == 'Linear peptide'
+    is_missing_position = is_linear & (start.isna() | end.isna())
+
+    total_count = len(df)
+    dropped_df = df.loc[is_missing_position].reset_index(drop=True)
+    filtered_df = df.loc[~is_missing_position].reset_index(drop=True)
+
+    if len(dropped_df):
+        names = dropped_df['Name'].astype(str).tolist() if 'Name' in df.columns else []
+        sample = ', '.join(names[:5])
+        more = '' if len(names) <= 5 else f" (+{len(names) - 5} more)"
+        print(
+            f"Removed {len(dropped_df)} 'Linear peptide' row(s) missing/non-numeric Starting or "
+            f"Ending Position out of {total_count} total rows; {len(filtered_df)} rows remain. "
+            f"Examples: {sample}{more}"
+        )
+
+    return filtered_df, dropped_df
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Build a standardized Sequence Feature (SF) table from an IEDB epitope "
+                    "search export (.xlsx)."
+    )
+    parser.add_argument(
+        "xlsx_file",
+        help="Path to the IEDB epitope export Excel file (.xlsx).",
+    )
+    parser.add_argument(
+        "-o", "--outdir",
+        required=True,
+        help="Directory where the output CSV will be written (created if missing).",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        default="output",
+        help="Prefix used to name the output SF table, e.g. '<name>_Epitope_SF.csv' "
+             "(default: 'output').",
+    )
+    parser.add_argument(
+        "--sheet",
+        default=0,
+        help="Sheet name or 0-based sheet index to read from the Excel file "
+             "(default: 0, the first sheet).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # Sheet can be given as a name (string) or a 0-based index (int) - try to interpret
+    # numeric-looking input as an index, otherwise treat it as a sheet name.
+    sheet = args.sheet
+    if isinstance(sheet, str) and sheet.isdigit():
+        sheet = int(sheet)
+
+    #read the Excel file containing epitope data (IEDB exports come as .xlsx with multiple
+    #sheets; the epitope table itself is on the first sheet by default).
+    df_temp = pd.read_excel(args.xlsx_file, sheet_name=sheet)
+
+    # Remove columns containing "Related Object" in their header
+    df_epitope = df_temp.loc[:, ~df_temp.columns.str.contains("Related Object")]
+
+    #remove the first row and make the second row the header
+    df_epitope.columns = df_epitope.iloc[0]
+    df_epitope = df_epitope[1:]
+    #reset the index
+    df_epitope.reset_index(drop=True, inplace=True)
+
+    print(df_epitope.columns)
+
+    #drop "Discontinuous peptide on multi chain" entries before they proceed downstream
+    df_epitope = filter_multichain_discontinuous(df_epitope)
+
+    #drop 'Linear peptide' entries with a missing/non-numeric Starting or Ending Position;
+    #keep the dropped rows so they can be reviewed instead of silently disappearing
+    df_epitope, dropped_missing_position = filter_missing_linear_positions(df_epitope)
+    if len(dropped_missing_position):
+        dropped_file_path = os.path.join(args.outdir, f"{args.name}_Epitope_dropped_missing_position.csv")
+        dropped_missing_position.to_csv(dropped_file_path, index=False)
+        print(f"Rows dropped for missing Starting/Ending Position saved to {dropped_file_path}.")
+
+    #create an empty dataframe for the new SF table with the features extracted from UniProt
+    columns = ['virus_type', 'subtype', 'segment', 'genbank_accession', 'gene', 'product', 'sf_category',
+               'sf_type', 'start', 'end', 'segments', 'Source', 'source_id',
+               'source_strain', 'source_aa_sequence', 'source_sf_location', 'Evidence_code',
+               'additional_metadata', 'comments']
+
+    sf_table_epitope = pd.DataFrame(columns=columns)
+
+    # Ensure sf_table_epitope has the same number of rows as df_epitope
+    sf_table_epitope = sf_table_epitope.reindex(range(len(df_epitope)))
+
+    # Assign values to the new DataFrame from the df_epitope DataFrame
+    sf_table_epitope['sf_type'] = "epitope"
+    sf_table_epitope['virus_type'] = df_epitope['Species'].values
+    sf_table_epitope['product'] = df_epitope['Source Molecule'].values
+    sf_table_epitope['sf_category'] = 'Epitope'
+    sf_table_epitope['Source'] = "IEDB"
+    sf_table_epitope['Evidence_code'] = "EXP"
+    sf_table_epitope['comments'] = "Epitope, " + df_epitope['Object Type'].fillna('').astype(str)
+
+    #call function to obtain the IEDB ID for each epitope
+    sf_table_epitope['source_id'] = extract_iedb_id(df_epitope)
+
+    # call function to obtain the source accession for each epitope
+    sf_table_epitope['additional_metadata'] = extract_source_accession(df_epitope)
+
+    #call function to parse the epitope information and obtain source_sf_location, length and source_aa_sequence
+    parsed_epitope_info = parse_epitope_info(df_epitope)
+    print(parsed_epitope_info)
+    sf_table_epitope['source_sf_location'] = parsed_epitope_info['source_sf_location']
+    sf_table_epitope['length'] = parsed_epitope_info['length']
+    sf_table_epitope['source_aa_sequence'] = parsed_epitope_info['source_aa_sequence']
+
+    #write sf_table_epitope to a csv file
+    sf_table_epitope_file_path = os.path.join(args.outdir, f"{args.name}_Epitope_SF.csv")
+    sf_table_epitope.to_csv(sf_table_epitope_file_path, index=False)
+
+    print(f"{args.name}_Epitope_SF.csv saved to {sf_table_epitope_file_path}.")
+
+
+if __name__ == "__main__":
+    main()
 

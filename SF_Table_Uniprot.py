@@ -5,6 +5,9 @@ import time
 import os
 import ast
 
+# shared so step 1's 'length' and step 4's coordinate mapping agree on which types are pairs
+from sf_columns import PAIR_SF_TYPES, read_csv, write_csv
+
 #function to filter a UniProt TSV export down to only reviewed (Swiss-Prot) entries,
 #based on the 'Reviewed' column populated by UniProt taxonomic-search exports.
 def filter_reviewed_entries(uniprot_info):
@@ -24,13 +27,31 @@ def filter_reviewed_entries(uniprot_info):
     )
     return reviewed_df
 
+def get_json_with_retries(url, retries=4, timeout=60):
+    """GET a UniProt JSON document, retrying rate limits and server errors with a growing wait.
+    Without this a single transient failure silently drops a protein's features."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, timeout=timeout)
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {response.status_code}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+    raise last_error
+
+
 #function to extract UniProt features from a TSV file obtained from taxonomic search of Uniprot
 # and output a csv file with the all extracted features from multiple UniProt IDs.
 #tsv_file_path: path to the TSV file containing UniProt IDs from taxonomic search
 
 def extract_and_merge_uniprot_features(tsv_file_path):
     # Read TSV file for UniProt IDs
-    uniprot_info = pd.read_csv(tsv_file_path, delimiter="\t")
+    uniprot_info = read_csv(tsv_file_path, delimiter="\t")
 
     # Keep only reviewed (Swiss-Prot) entries; unreviewed entries do not proceed downstream
     uniprot_info = filter_reviewed_entries(uniprot_info)
@@ -47,21 +68,36 @@ def extract_and_merge_uniprot_features(tsv_file_path):
     )
 
     global_df = pd.DataFrame()
+    failed = []
 
     for uniprot_id in uniprot_ids:
         query_url = base_url.format(uniprot_id) + "?fields=" + fields
         try:
-            response = requests.get(query_url)
-            response.raise_for_status()
-            data = response.json()
+            data = get_json_with_retries(query_url)
             if 'features' in data:
                 dict_df = pd.json_normalize(data['features'])
                 dict_df['uniprot_id'] = uniprot_id
                 print(f"Data for {uniprot_id} retrieved successfully.")
                 global_df = pd.concat([global_df, dict_df], ignore_index=True)
+            else:
+                print(f"{uniprot_id} has no annotated features.")
         except Exception as e:
             print(f"An error occurred for {uniprot_id}: {e}")
+            failed.append(uniprot_id)
         time.sleep(1)
+
+    if failed:
+        # Carrying on would hand every later step a table silently missing these proteins.
+        raise SystemExit(
+            f"{len(failed)} of {len(uniprot_ids)} UniProt entries could not be retrieved even "
+            f"after retries, so the feature table would be incomplete: {', '.join(failed)}. "
+            "Re-run to try them again."
+        )
+    if global_df.empty:
+        raise SystemExit(
+            "None of the reviewed UniProt entries has annotated features, so there is "
+            "nothing to build a table from."
+        )
 
     merged_df = pd.merge(global_df, uniprot_info, left_on='uniprot_id', right_on='Entry')
     return merged_df
@@ -167,7 +203,7 @@ def main():
 
     # Save the merged DataFrame to a CSV file
     merged_dataframe_file_path = os.path.join(args.outdir, args.merged_filename)
-    merged_df.to_csv(merged_dataframe_file_path, index=False)
+    write_csv(merged_df, merged_dataframe_file_path)
     print(f"All features saved to {merged_dataframe_file_path}.")
 
     #create an empty dataframe for the new SF table with the features extracted from UniProt
@@ -190,8 +226,14 @@ def main():
     sf_table_uniprot['virus_type'] = merged_df['Organism'].values
     sf_table_uniprot['Evidence_code'] = "EXP"
 
-    #calculate the length of the feature
-    sf_table_uniprot['length'] = (merged_df['location.end.value'] - merged_df['location.start.value']) + 1
+    #calculate the length of the feature. For a disulfide bond or cross-link, 'start-end' is
+    #the pair of residues that are bonded rather than a span, so the feature is the 2 residues
+    #themselves (1 if UniProt reported the same position twice) - not end-start+1, which would
+    #call a bond between Cys188 and Cys606 a 419-residue feature.
+    span_length = (merged_df['location.end.value'] - merged_df['location.start.value']) + 1
+    is_pair = merged_df['type'].isin(PAIR_SF_TYPES)
+    pair_length = (merged_df['location.end.value'] != merged_df['location.start.value']).map({True: 2, False: 1})
+    sf_table_uniprot['length'] = span_length.where(~is_pair, pair_length)
 
     #fill the source_sf_location column with start and end positions
     sf_table_uniprot['source_sf_location'] = (
@@ -210,7 +252,7 @@ def main():
 
     #write sf_table_uniprot to a csv file
     sf_table_uniprot_file_path = os.path.join(args.outdir, f"{args.name}_Uniprot_SF.csv")
-    sf_table_uniprot.to_csv(sf_table_uniprot_file_path, index=False)
+    write_csv(sf_table_uniprot, sf_table_uniprot_file_path)
 
     print(f"{args.name}_Uniprot_SF.csv saved to {sf_table_uniprot_file_path}.")
 

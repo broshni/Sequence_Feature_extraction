@@ -2,6 +2,8 @@
 import argparse
 import os
 import pandas as pd
+
+from sf_columns import write_csv
 import re
 
 #read the "IEDB IRI" column from the DataFrame. split the string by '/' and take the last part as the IEBD ID.
@@ -252,7 +254,7 @@ def main():
     df_epitope, dropped_missing_position = filter_missing_linear_positions(df_epitope)
     if len(dropped_missing_position):
         dropped_file_path = os.path.join(args.outdir, f"{args.name}_Epitope_dropped_missing_position.csv")
-        dropped_missing_position.to_csv(dropped_file_path, index=False)
+        write_csv(dropped_missing_position, dropped_file_path)
         print(f"Rows dropped for missing Starting/Ending Position saved to {dropped_file_path}.")
 
     #create an empty dataframe for the new SF table with the features extracted from UniProt
@@ -290,7 +292,7 @@ def main():
 
     #write sf_table_epitope to a csv file
     sf_table_epitope_file_path = os.path.join(args.outdir, f"{args.name}_Epitope_SF.csv")
-    sf_table_epitope.to_csv(sf_table_epitope_file_path, index=False)
+    write_csv(sf_table_epitope, sf_table_epitope_file_path)
 
     print(f"{args.name}_Epitope_SF.csv saved to {sf_table_epitope_file_path}.")
 

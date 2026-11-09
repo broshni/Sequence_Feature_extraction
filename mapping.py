@@ -12,6 +12,9 @@ from urllib.error import HTTPError, URLError
 from Bio import AlignIO
 import pandas as pd
 from Bio import Entrez, SeqIO
+
+# PAIR_SF_TYPES: feature types whose 'a-b' location is a residue pair, not a span.
+from sf_columns import PAIR_SF_TYPES, read_csv, write_csv
 import subprocess
 import requests as r
 from io import StringIO
@@ -82,62 +85,121 @@ def align_sequences(ref_seq, otherseq, output_file):
         raise RuntimeError(f"mafft alignment failed (exit code {result.returncode})")
 
 
-def parse_source_coordinates(coordinates):
-    if "-" in coordinates:
-        coordinate_list = coordinates.split("-")
-        coordinate_list = [int(i) for i in coordinate_list]
-        coordinate_list.sort()
-    elif "," in coordinates:
-        coordinate_list = coordinates.split(",")
-        coordinate_list = [int(i) for i in coordinate_list]
-        coordinate_list.sort()
+def is_pair_feature(sf_type):
+    """True if this feature type's 'a-b' location means two discrete residues, not a range."""
+    return str(sf_type).strip() in PAIR_SF_TYPES
+
+
+def wanted_source_residues(coordinates, is_pair=False):
+    """The source residues a location refers to, and whether they form a contiguous span.
+
+    'a-b' is every residue from a to b - except for residue-pair types (disulfide bonds), where
+    it is just residues a and b. 'a,b,c' is exactly those residues. 'a' is that one residue.
+    """
+    text = str(coordinates).strip()
+    if '-' in text:
+        ends = sorted(int(part) for part in text.split('-'))
+        if len(ends) != 2:
+            raise ValueError(f"Could not parse location '{coordinates}'")
+        if ends[0] == ends[1]:
+            return [ends[0]], True          # one residue, e.g. a disulfide reported as '139-139'
+        return (ends, False) if is_pair else (list(range(ends[0], ends[1] + 1)), True)
+    if ',' in text:
+        return sorted({int(part) for part in text.split(',')}), False
+    return [int(text)], True
+
+
+def residue_map(alignment):
+    """For every source residue (1-based): (alignment column, reference residue position).
+
+    The reference position is None where the source residue sits in an insertion, a stretch
+    the reference has no residues for. Alignment columns are NOT reference positions: the
+    reference row has gaps wherever the source has an insertion, and every column after a gap
+    is shifted by it, so reading columns as positions misplaces every feature after one.
+    """
+    ref_row, source_row = str(alignment[0].seq), str(alignment[1].seq)
+    placed, ref_position, source_position = {}, 0, 0
+    for column, (ref_char, source_char) in enumerate(zip(ref_row, source_row), start=1):
+        if ref_char != '-':
+            ref_position += 1
+        if source_char != '-':
+            source_position += 1
+            placed[source_position] = (column, ref_position if ref_char != '-' else None)
+    return placed
+
+
+def percent_identity(alignment):
+    """Fraction of residues identical where source and reference are both present."""
+    both = [(r, s) for r, s in zip(str(alignment[0].seq), str(alignment[1].seq))
+            if r != '-' and s != '-']
+    if not both:
+        return 0.0
+    return sum(1 for r, s in both if r.upper() == s.upper()) / len(both)
+
+
+def map_feature(alignment, source_coordinates, is_pair=False):
+    """Place a source feature on the reference.
+
+    Returns (start, end, segments, source_seq, ref_seq), with start/end/segments in REFERENCE
+    residue positions and the two sequences cut from the alignment for just this feature.
+    """
+    residues, contiguous = wanted_source_residues(source_coordinates, is_pair)
+    placed = residue_map(alignment)
+    hits = [placed[r] for r in residues if r in placed and placed[r][1] is not None]
+    if not hits:
+        raise ValueError("None of the feature's residues could be placed on the reference")
+
+    ref_row, source_row = str(alignment[0].seq), str(alignment[1].seq)
+    columns = [column for column, _ in hits]
+    positions = [position for _, position in hits]
+    if contiguous:
+        first, last = min(columns), max(columns)
+        source_seq, ref_seq = source_row[first - 1:last], ref_row[first - 1:last]
+        start, end = min(positions), max(positions)
+        segments = f"{start}-{end}"
     else:
-        coordinate_list = [int(coordinates)]
-    return coordinate_list #return a list of coordinates
+        # discrete residues: just those columns, comma-separated so nothing reads them as a span
+        source_seq = ''.join(source_row[c - 1] for c in columns)
+        ref_seq = ''.join(ref_row[c - 1] for c in columns)
+        start, end = positions[0], positions[-1]
+        segments = ','.join(map(str, positions))
+    return start, end, segments, source_seq, ref_seq
 
 
-def get_ref_pos(alignment, num, coordinates):
-    # access the source through index
-    source_seq = alignment[num].seq
-
-    pos = 0  # set the starting pos
-    ref_position = []
-    for index, amino in enumerate(source_seq):
-        if amino != "-":
-            pos += 1
-            if pos in coordinates:
-                ref_position.append(index)
-
-    return ref_position
+def new_cache():
+    return {'sequences': {}, 'alignments': {}, 'failures': {}}
 
 
-#function to slice the alignment down to just the feature's mapped columns and return the
-#(source_seq, ref_seq) pair for those columns. Handles contiguous ('-'), discontinuous (','),
-#and single-position coordinate formats.
-def extract_sf_alignment(alignment, source_coordinates, new_list):
-    if not new_list:
-        raise ValueError("No aligned reference positions found for this feature")
-
-    if "-" in source_coordinates:
-        sf_alignment = alignment[:, (new_list[0] - 1):new_list[-1]]
-    elif "," in source_coordinates:
-        # extract each mapped column individually and concatenate them together
-        sf_alignment = None
-        for i in new_list:
-            col = alignment[:, (i - 1):i]
-            sf_alignment = col if sf_alignment is None else sf_alignment + col
-    else:
-        # single coordinate
-        sf_alignment = alignment[:, (new_list[0] - 1):new_list[0]]
-
-    return sf_alignment[1].seq, sf_alignment[0].seq
+def load_sequence(kind, identifier, cache, email, retries, retry_delay, timeout):
+    """A sequence from GenBank ('genbank') or UniProt ('uniprot'), fetched once per run.
+    A failed fetch is remembered too, so the dozens of rows sharing one bad accession do not
+    each spend a full round of retries rediscovering it."""
+    key = (kind, identifier)
+    if key in cache['failures']:
+        raise ValueError(cache['failures'][key])
+    if key not in cache['sequences']:
+        try:
+            if kind == 'genbank':
+                record = fetch_genbank_record(identifier, email=email, retries=retries,
+                                              retry_delay=retry_delay)
+                cache['sequences'][key] = str(record.seq)
+            else:
+                cache['sequences'][key] = str(fetch_uniprot(
+                    identifier, retries=retries, retry_delay=retry_delay, timeout=timeout))
+        except Exception as exc:
+            cache['failures'][key] = f"could not fetch {kind} sequence {identifier}: {exc}"
+            raise ValueError(cache['failures'][key]) from exc
+    return cache['sequences'][key]
 
 
 #function to map one SF table row's source_sf_location onto its reference sequence.
 #Returns (start, end, segments, source_seq, ref_seq); raises on any failure so the caller
 #can decide how to handle it (see main(), which leaves the row blank and moves on).
 def map_sf_row(row, ref_fasta_path, source_fasta_path, alignment_output_path,
-               email="rbhattac@jcvi.org", retries=3, retry_delay=5, timeout=30):
+               email="rbhattac@jcvi.org", retries=3, retry_delay=5, timeout=30,
+               min_identity=0.5, cache=None):
+    cache = cache if cache is not None else new_cache()
+
     source_coordinates = row['source_sf_location']
     if pd.isna(source_coordinates) or not str(source_coordinates).strip():
         raise ValueError("Missing source_sf_location")
@@ -147,47 +209,48 @@ def map_sf_row(row, ref_fasta_path, source_fasta_path, alignment_output_path,
     if pd.isna(ref_accession) or not str(ref_accession).strip():
         raise ValueError("Missing genbank_accession")
 
-    ref_record = fetch_genbank_record(ref_accession, email=email, retries=retries, retry_delay=retry_delay)
-    with open(ref_fasta_path, "w") as f:
-        f.write(f">{ref_accession}\n{ref_record.seq}\n")
-
     if str(row['Source']).lower() == 'uniprot':
-        source_id = row['source_id']
-        source_seq = fetch_uniprot(source_id, retries=retries, retry_delay=retry_delay, timeout=timeout)
+        source_kind, source_id = 'uniprot', row['source_id']
     else:
         metadata = str(row['additional_metadata'])
         parts = metadata.split(":")
         if len(parts) < 2:
-            raise ValueError(f"Could not parse additional_metadata '{metadata}'")
+            if metadata.strip() and metadata.strip().lower() != 'nan':
+                raise ValueError(f"Could not parse additional_metadata '{metadata}'")
+            # No source sequence named: the feature's coordinates are already numbered along
+            # the reference protein, as a paper's residue numbers are. Aligning the reference
+            # to itself maps them through unchanged and still records the residues involved.
+            parts = ['NCBI', str(ref_accession)]
         source_type, source_id = parts[0], parts[1]
         if source_type.upper() == 'NCBI':
-            source_record = fetch_genbank_record(source_id, email=email, retries=retries, retry_delay=retry_delay)
-            source_seq = source_record.seq
+            source_kind = 'genbank'
         elif source_type.lower() == 'uniprot':
-            source_seq = fetch_uniprot(source_id, retries=retries, retry_delay=retry_delay, timeout=timeout)
+            source_kind = 'uniprot'
         else:
             raise ValueError(f"Unrecognized source type '{source_type}' in additional_metadata")
 
-    with open(source_fasta_path, "w") as f:
-        f.write(f">{source_id}\n{source_seq}\n")
+    # one alignment per (reference, source) pair - a table has thousands of rows but only a
+    # few dozen distinct source proteins, so aligning per row repeats the same work
+    pair = (ref_accession, source_kind, source_id)
+    if pair not in cache['alignments']:
+        ref_seq = load_sequence('genbank', ref_accession, cache, email, retries, retry_delay, timeout)
+        source_seq = load_sequence(source_kind, source_id, cache, email, retries, retry_delay, timeout)
+        with open(ref_fasta_path, "w") as f:
+            f.write(f">{ref_accession}\n{ref_seq}\n")
+        with open(source_fasta_path, "w") as f:
+            f.write(f">{source_id}\n{source_seq}\n")
+        align_sequences(ref_fasta_path, source_fasta_path, alignment_output_path)
+        cache['alignments'][pair] = AlignIO.read(alignment_output_path, "fasta")
+    alignment = cache['alignments'][pair]
 
-    align_sequences(ref_fasta_path, source_fasta_path, alignment_output_path)
-    alignment = AlignIO.read(alignment_output_path, "fasta")
+    # A source that barely resembles the reference is a different protein (or another
+    # organism's), and the "mapping" would be coordinates on a meaningless alignment.
+    identity = percent_identity(alignment)
+    if identity < min_identity:
+        raise ValueError(f"source {source_id} is only {identity:.0%} identical to reference "
+                         f"{ref_accession} (minimum {min_identity:.0%}) - not the same protein")
 
-    coordinates = parse_source_coordinates(source_coordinates)
-    ref_pos = get_ref_pos(alignment, 1, coordinates)
-    new_list = [x + 1 for x in ref_pos]
-
-    if not new_list:
-        raise ValueError("Could not map any source coordinates onto the reference alignment")
-
-    start = new_list[0]
-    end = new_list[-1]
-    segments = ','.join(map(str, new_list)) if len(new_list) > 2 else f"{start}-{end}"
-
-    source_seq_sf, ref_seq_sf = extract_sf_alignment(alignment, source_coordinates, new_list)
-
-    return start, end, segments, str(source_seq_sf), str(ref_seq_sf)
+    return map_feature(alignment, source_coordinates, is_pair_feature(row.get('sf_type')))
 
 
 def parse_args():
@@ -215,8 +278,9 @@ def parse_args():
     )
     parser.add_argument(
         "--encoding",
-        default="latin-1",
-        help="Text encoding to use when reading the input CSV (default: 'latin-1').",
+        default=None,
+        help="Force a text encoding for the input CSV. By default it is read as UTF-8, "
+             "falling back per byte to Windows-1252.",
     )
     parser.add_argument(
         "--email",
@@ -246,6 +310,14 @@ def parse_args():
         help="Timeout in seconds for each UniProt HTTP request (default: 30).",
     )
     parser.add_argument(
+        "--min-identity",
+        type=float,
+        default=0.5,
+        help="Skip a row when its source sequence is less than this fraction identical to the "
+             "reference protein it is being mapped onto (default: 0.5). Catches another "
+             "organism's protein, or the wrong protein, rather than mapping onto it.",
+    )
+    parser.add_argument(
         "--row-delay",
         type=float,
         default=1,
@@ -271,7 +343,7 @@ def main():
     output_file = os.path.join(args.outdir, f"{args.name}_SF_mapped.csv")
 
     #read the merged SF table as a dataframe - the output keeps every column from this table
-    sf_table = pd.read_csv(args.input_file, encoding=args.encoding)
+    sf_table = read_csv(args.input_file, **({'encoding': args.encoding} if args.encoding else {}))
 
     # 'start', 'end' and 'segments' already exist (empty) in the merged SF table schema;
     # Source_Sequence/Ref_sequence are new. Force all five to an object dtype so an
@@ -283,13 +355,14 @@ def main():
         sf_table[col] = sf_table[col].astype('object')
 
     failed_rows = []
+    cache = new_cache()
     for index, row in sf_table.iterrows():
         print(f"Processing row {index} (source_id={row.get('source_id', '')})...")
         try:
             start, end, segments, source_seq, ref_seq = map_sf_row(
                 row, ref_fasta_path, source_fasta_path, alignment_output_path,
                 email=args.email, retries=args.retries, retry_delay=args.retry_delay,
-                timeout=args.timeout,
+                timeout=args.timeout, min_identity=args.min_identity, cache=cache,
             )
         except Exception as e:
             print(
@@ -310,7 +383,7 @@ def main():
         if args.row_delay:
             time.sleep(args.row_delay)
 
-    sf_table.to_csv(output_file, index=False)
+    write_csv(sf_table, output_file)
     print(f"Mapping results saved to {output_file}")
     if failed_rows:
         print(

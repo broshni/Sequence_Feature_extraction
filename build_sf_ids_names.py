@@ -4,13 +4,15 @@ import os
 import sys
 import pandas as pd
 
-# create_sf_ids() groups by 'virus_type'+'gene', and create_sf_names() reads 'virus_type',
-# 'gene', 'sf_type', 'start' and 'length' for every row. A blank 'gene' is especially
-# dangerous here: pandas' groupby drops NaN-key rows from cumcount() by default, so every
-# row with a missing gene would collide on the same non-unique sf_id (e.g.
-# "Measles_nan_SFnan" for all of them). So check upfront that these cells are populated,
-# and refuse to proceed (rather than silently produce broken/duplicate IDs) if they're not.
-REQUIRED_COLUMNS = ['virus_type', 'gene', 'sf_type', 'start', 'length']
+from sf_columns import PUBMED_SOURCE, read_csv, write_csv
+
+# create_sf_ids() groups by gene, and create_sf_names() reads 'gene', 'sf_type', 'start' and
+# 'length' for every row. A blank 'gene' is especially dangerous here: pandas' groupby drops
+# NaN-key rows from cumcount() by default, so every row with a missing gene would collide on
+# the same non-unique sf_id (e.g. "Measles_nan_SFnan" for all of them). So check upfront that
+# these cells are populated, and refuse to proceed (rather than silently produce
+# broken/duplicate IDs) if they're not.
+REQUIRED_COLUMNS = ['gene', 'sf_type', 'start', 'length']
 
 
 def find_incomplete_columns(df, required_columns):
@@ -33,35 +35,79 @@ def find_incomplete_columns(df, required_columns):
     return problems
 
 
-#create sf_id in the format: virus_type_gene_SF followed by a unique number. The unique number should be grouped by the
-#genes and virus_type. For example, if the virus_type is SARS-CoV-2 and the gene is S, then the SF_ids should be
-#SARS-CoV-2_S_SF1, SARS-CoV-2_S_SF2, etc. for each SF in the gene S. Repeat for all genes and virus_types in the table.
-def create_sf_ids(df):
-    df['sf_id'] = df.groupby(['virus_type', 'gene']).cumcount() + 1
-    df['sf_id'] = df.apply(lambda x: f"{x['virus_type']}_{x['gene']}_SF{x['sf_id']}", axis=1)
-    df['sf_id'] = df['sf_id'].str.replace(r'\.0$', '', regex=True)
+def as_int(value):
+    """'525.0' -> '525'. Coordinates and lengths are whole numbers; they only arrive looking
+    like floats because pandas reads any column containing a blank cell as float64."""
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def resolve_gene(df):
+    """The gene each sf_id is keyed on. Prefer 'gene_ref' (the reference genome's gene name):
+    sf_ids describe a position on the reference, while the sources' own gene strings vary by
+    entry for what is one reference gene ('N' vs 'N NP', 'P' vs 'P/V' vs 'P/V P'), which would
+    otherwise split one gene's IDs across several namespaces."""
+    if 'gene_ref' not in df.columns:
+        return df['gene'].astype(str)
+    gene_ref = df['gene_ref']
+    has_ref = gene_ref.notna() & (gene_ref.astype(str).str.strip() != '')
+    return gene_ref.where(has_ref, df['gene']).astype(str)
+
+
+#create sf_id in the format: virus_gene_SF followed by a number unique within that gene. For
+#example, with virus name SARS-CoV-2 and gene S the sf_ids are SARS-CoV-2_S_SF1,
+#SARS-CoV-2_S_SF2, etc. The virus name is one constant for the whole table, so the same
+#feature does not get a different id per source strain.
+def create_sf_ids(df, virus_name):
+    gene = resolve_gene(df)
+    numbers = df.groupby(gene).cumcount() + 1
+    df['sf_id'] = [f"{virus_name}_{g}_SF{n}" for g, n in zip(gene, numbers)]
     return df
 
 
-# create sf_names in the format: virus_type_gene_sf_type_start(length).
-def create_sf_names(df):
-    df['sf_name'] = df.apply(
-        lambda x: f"{x['virus_type']}_{x['gene']}_{x['sf_type']}_{x['start']}({x['length']})",
-        axis=1
-    )
+# create sf_names in the format: virus_gene_sf_type_start(length).
+def create_sf_names(df, virus_name):
+    gene = resolve_gene(df)
+    df['sf_name'] = [
+        f"{virus_name}_{g}_{t}_{as_int(start)}({as_int(length)})"
+        for g, t, start, length in zip(gene, df['sf_type'], df['start'], df['length'])
+    ]
     return df
 
 
-#function to remove .0 from the sf_name example change "Measles Virus_N_Compositional bias_433.0(20)" to "Measles Virus_N_Compositional bias_433(20)"
-def remove_decimal_from_sf_name(df):
-    df['sf_name'] = df['sf_name'].str.replace(r'\.0\(', '(', regex=True)
+def name_virus_column(df, virus_name):
+    """Give the table one clean virus_type - the same name the sf_ids use - and keep each row's
+    original organism string as virus_type_source.
+
+    The sources name the organism in their own way, at strain level and with their own
+    punctuation ('Ebola virus (strain Mayinga-76)', 'Zaire ebolavirus'), so the column cannot
+    be used to say which virus the table is for. Renaming it keeps that provenance while
+    virus_type becomes a single, uniform value.
+    """
+    # on a re-run the table already has virus_type_source; renaming again would duplicate it
+    if 'virus_type_source' not in df.columns:
+        df = df.rename(columns={'virus_type': 'virus_type_source'})
+    df = df.drop(columns=['virus_type'], errors='ignore')
+    df.insert(0, 'virus_type', virus_name)
+    return df
+
+
+def add_pubmed_flag(df):
+    """A plain yes/no column saying whether a row came from the PubMed miner, placed directly
+    after source_id so the provenance reads together: Source, source_id, and this."""
+    flag = 'sourced from pubmed miner'
+    df = df.drop(columns=[flag], errors='ignore')
+    values = (df['Source'].astype(str).str.strip() == PUBMED_SOURCE).map({True: 'yes', False: 'no'})
+    df.insert(df.columns.get_loc('source_id') + 1, flag, values)
     return df
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Add sf_id and sf_name columns to a deduplicated SF table, producing the "
-                    "final SF table. Requires virus_type/gene/sf_type/start/length to already "
+                    "final SF table. Requires gene/sf_type/start/length to already "
                     "be fully populated (e.g. via mapping.py and merge_same_SF_coordinates.py)."
     )
     parser.add_argument(
@@ -79,9 +125,17 @@ def parse_args():
         help="Prefix used to name the output file, e.g. '<name>_SF_Final.csv' (default: 'output').",
     )
     parser.add_argument(
+        "--virus-name",
+        default=None,
+        help="Short virus name used to build sf_id/sf_name, e.g. 'Measles' giving "
+             "'Measles_N_SF3'. Defaults to --name. The raw 'virus_type' column is not used: "
+             "it carries a full strain description that differs per source entry.",
+    )
+    parser.add_argument(
         "--encoding",
-        default="latin-1",
-        help="Text encoding to use when reading the input CSV (default: 'latin-1').",
+        default=None,
+        help="Force a text encoding for the input CSV. By default it is read as UTF-8, "
+             "falling back per byte to Windows-1252.",
     )
     return parser.parse_args()
 
@@ -90,7 +144,7 @@ def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    sf_table = pd.read_csv(args.input_file, encoding=args.encoding)
+    sf_table = read_csv(args.input_file, **({'encoding': args.encoding} if args.encoding else {}))
 
     problems = find_incomplete_columns(sf_table, REQUIRED_COLUMNS)
     if problems:
@@ -99,13 +153,15 @@ def main():
         print("\nPopulate these columns and re-run this script.")
         sys.exit(1)
 
-    sf_table = create_sf_ids(sf_table)
-    sf_table = create_sf_names(sf_table)
-    sf_table = remove_decimal_from_sf_name(sf_table)
+    virus_name = args.virus_name or args.name
+    sf_table = name_virus_column(sf_table, virus_name)
+    sf_table = add_pubmed_flag(sf_table)
+    sf_table = create_sf_ids(sf_table, virus_name)
+    sf_table = create_sf_names(sf_table, virus_name)
     print(sf_table)
 
     output_file = os.path.join(args.outdir, f"{args.name}_SF_Final.csv")
-    sf_table.to_csv(output_file, index=False)
+    write_csv(sf_table, output_file)
     print(f"Final SF table saved to {output_file}")
 
 

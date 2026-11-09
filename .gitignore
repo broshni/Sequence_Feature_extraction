@@ -12,3 +12,17 @@ venv/
 
 # Pipeline scratch/output (generated CSVs, xlsx exports, alignment scratch files)
 *_mapping_scratch/
+*_SF.csv
+*_SF_*.csv
+*_dedup.csv
+*_reference*.csv
+*_aliases*.csv
+*_dropped_*.csv
+merged_features.csv
+
+# Source data and miner exports belong with the run, not in the repo
+*_LLM_findings_*.json
+*_LLM_findings_*.csv
+*.xlsx
+*.tsv
+*.tsv.gz
